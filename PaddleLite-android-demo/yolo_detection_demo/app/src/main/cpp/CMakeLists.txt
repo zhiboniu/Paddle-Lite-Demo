@@ -33,7 +33,7 @@ add_library(
   # Sets the library as a shared library.
   SHARED
   # Provides a relative path to your source file(s).
-  Native.cc Pipeline.cc Utils.cc)
+  Native.cc postprocess.cc Pipeline.cc Utils.cc)
 
 find_library(
   # Sets the name of the path variable.

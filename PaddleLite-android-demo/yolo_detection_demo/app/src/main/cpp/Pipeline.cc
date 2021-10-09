@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "Pipeline.h"
+#include "postprocess.h"
 
 Detector::Detector(const std::string &modelDir, const std::string &labelPath,
                    const int cpuThreadNum, const std::string &cpuPowerMode,
@@ -28,6 +29,7 @@ Detector::Detector(const std::string &modelDir, const std::string &labelPath,
   predictor_ =
       paddle::lite_api::CreatePaddlePredictor<paddle::lite_api::MobileConfig>(
           config);
+
   labelList_ = LoadLabelList(labelPath);
   colorMap_ = GenerateColorMap(labelList_.size());
 }
@@ -96,6 +98,8 @@ void Detector::Postprocess(std::vector<RESULT> *results) {
     auto class_id = static_cast<int>(round(outputData[i]));
     // Confidence score
     auto score = outputData[i + 1];
+    if (class_id != 0)
+      continue;
     if (score < scoreThreshold_)
       continue;
     RESULT object;
@@ -135,6 +139,175 @@ void Detector::Predict(const cv::Mat &rgbaImage, std::vector<RESULT> *results,
   LOGD("Detector postprocess costs %f ms", *postprocessTime);
 }
 
+//KeyPoint Detector
+
+Detector_KeyPoint::Detector_KeyPoint(const std::string &modelDir, const std::string &labelPath,
+                   const int cpuThreadNum, const std::string &cpuPowerMode,
+                   int inputWidth, int inputHeight,
+                   const std::vector<float> &inputMean,
+                   const std::vector<float> &inputStd, float scoreThreshold)
+    : inputWidth_(inputWidth), inputHeight_(inputHeight), inputMean_(inputMean),
+      inputStd_(inputStd), scoreThreshold_(scoreThreshold) {
+  paddle::lite_api::MobileConfig config;
+  config.set_model_from_file(modelDir + "/model_keypoint_hrnet32.nb");
+  config.set_threads(cpuThreadNum);
+  config.set_power_mode(ParsePowerMode(cpuPowerMode));
+  predictor_keypoint_ =
+      paddle::lite_api::CreatePaddlePredictor<paddle::lite_api::MobileConfig>(
+          config);
+
+  colorMap_ = GenerateColorMap(17); //coco keypoint number is 17
+}
+
+std::vector<cv::Scalar> Detector_KeyPoint::GenerateColorMap(int numOfClasses) {
+  std::vector<cv::Scalar> colorMap = std::vector<cv::Scalar>(numOfClasses);
+  for (int i = 0; i < numOfClasses; i++) {
+    int j = 0;
+    int label = i;
+    int R = 0, G = 0, B = 0;
+    while (label) {
+      R |= (((label >> 0) & 1) << (7 - j));
+      G |= (((label >> 1) & 1) << (7 - j));
+      B |= (((label >> 2) & 1) << (7 - j));
+      j++;
+      label >>= 3;
+    }
+    colorMap[i] = cv::Scalar(R, G, B);
+  }
+  return colorMap;
+}
+
+void Detector_KeyPoint::Preprocess(const cv::Mat &rgbaImage) {
+  // Set the data of input image
+  auto inputTensor = predictor_keypoint_->GetInput(0);
+  std::vector<int64_t> inputShape = {1, 3, inputHeight_, inputWidth_};
+  inputTensor->Resize(inputShape);
+  auto inputData = inputTensor->mutable_data<float>();
+  cv::Mat resizedRGBAImage;
+  cv::resize(rgbaImage, resizedRGBAImage, cv::Size(inputShape[3], inputShape[2]));
+  cv::Mat resizedRGBImage;
+  cv::cvtColor(resizedRGBAImage, resizedRGBImage, cv::COLOR_BGRA2RGB);
+  resizedRGBImage.convertTo(resizedRGBImage, CV_32FC3, 1.0 / 255.0f);
+  NHWC3ToNC3HW(reinterpret_cast<const float *>(resizedRGBImage.data), inputData,
+               inputMean_.data(), inputStd_.data(), inputShape[3],
+               inputShape[2]);
+  // Set the size of input image
+//  auto sizeTensor = predictor_keypoint_->GetInput(1);
+//  sizeTensor->Resize({1, 2});
+//  auto sizeData = sizeTensor->mutable_data<int32_t>();
+//  sizeData[0] = inputShape[3];
+//  sizeData[1] = inputShape[2];
+}
+
+void Detector_KeyPoint::Postprocess(std::vector<RESULT_KEYPOINT> *results,
+                                   std::vector<std::vector<float>>& center_bs,
+                                   std::vector<std::vector<float>>& scale_bs) {
+  auto outputTensor = predictor_keypoint_->GetOutput(0);
+  auto outputdata = outputTensor->data<float>();
+  auto output_shape = outputTensor->shape();
+  int outputSize = ShapeProduction(output_shape);
+  auto outidx_Tensor = predictor_keypoint_->GetOutput(1);
+  auto idxoutdata = outidx_Tensor->data<int64_t>();
+  auto idx_shape = outidx_Tensor->shape();
+  int idxoutSize = ShapeProduction(idx_shape);
+
+  std::vector<float> output;
+  std::vector<int64_t> idxout;
+  output.resize(outputSize);
+  std::copy_n(outputdata, outputSize, output.data());
+  idxout.resize(idxoutSize);
+  std::copy_n(idxoutdata, idxoutSize, idxout.data());
+
+  std::vector<float> preds(output_shape[1] * 3, 0);
+
+  for (int batchid = 0; batchid < output_shape[0]; batchid++) {
+    get_final_preds(output,
+                    output_shape,
+                    idxout,
+                    idx_shape,
+                    center_bs[batchid],
+                    scale_bs[batchid],
+                    preds,
+                    batchid,
+                    this->use_dark);
+    RESULT_KEYPOINT result_item;
+    result_item.num_joints = output_shape[1];
+    result_item.keypoints.clear();
+    for (int i = 0; i < output_shape[1]; i++) {
+      result_item.keypoints.emplace_back(preds[i * 3]);
+      result_item.keypoints.emplace_back(preds[i * 3 + 1]);
+      result_item.keypoints.emplace_back(preds[i * 3 + 2]);
+    }
+    results->push_back(result_item);
+  }
+}
+
+void Detector_KeyPoint::Predict(const cv::Mat &rgbaImage, std::vector<RESULT> *results, std::vector<RESULT_KEYPOINT> *results_kpts, 
+                       double *preprocessTime, double *predictTime,
+                       double *postprocessTime){
+  if(results->empty())
+    return;
+  auto t = GetCurrentTime();
+  std::vector<float> center, scale;
+  std::vector<std::vector<float>> center_bs;
+  std::vector<std::vector<float>> scale_bs;
+  cv::Mat cropimgs;
+  CropImg(rgbaImage, cropimgs, (*results)[0], center, scale);
+  center_bs.emplace_back(center);
+  scale_bs.emplace_back(scale);
+  t = GetCurrentTime();
+  Preprocess(cropimgs);
+  *preprocessTime = GetElapsedTime(t);
+  LOGD("Detector_KeyPoint postprocess costs %f ms", *preprocessTime);
+
+  t = GetCurrentTime();
+  predictor_keypoint_->Run();
+  *predictTime = GetElapsedTime(t);
+  LOGD("Detector_KeyPoint predict costs %f ms", *predictTime);
+
+  t = GetCurrentTime();
+  Postprocess(results_kpts, center_bs, scale_bs);
+  *postprocessTime = GetElapsedTime(t);
+  LOGD("Detector_KeyPoint postprocess costs %f ms", *postprocessTime);
+}
+
+void Detector_KeyPoint::CropImg(const cv::Mat &img, cv::Mat &crop_img, RESULT area, std::vector<float> &center, std::vector<float> &scale, float expandratio) {
+  int w = img.cols;
+  int h = img.rows;
+  int crop_x1 = std::max(0, static_cast<int>(area.x * w));
+  int crop_y1 = std::max(0, static_cast<int>(area.y * h));
+  int crop_x2 = std::min(img.cols -1, static_cast<int>((area.x + area.w)*w));
+  int crop_y2 = std::min(img.rows - 1, static_cast<int>((area.y + area.h)*h));
+  int center_x = (crop_x1 + crop_x2)/2.;
+  int center_y = (crop_y1 + crop_y2)/2.;
+  int half_h = (crop_y2 - crop_y1)/2.;
+  int half_w = (crop_x2 - crop_x1)/2.;
+
+  //adjust h or w to keep image ratio, expand the shorter edge
+  if (half_h*3 > half_w*4){
+    half_w = static_cast<int>(half_h*0.75);
+  }
+  else{
+    half_h = static_cast<int>(half_w*4/3);
+  }
+
+  crop_x1 = std::max(0, center_x - static_cast<int>(half_w*(1+expandratio)));
+  crop_y1 = std::max(0, center_y - static_cast<int>(half_h*(1+expandratio)));
+  crop_x2 = std::min(img.cols -1, static_cast<int>(center_x + half_w*(1+expandratio)));
+  crop_y2 = std::min(img.rows - 1, static_cast<int>(center_y + half_h*(1+expandratio)));
+  crop_img = img(cv::Range(crop_y1, crop_y2+1), cv::Range(crop_x1, crop_x2 + 1));
+
+  center.clear();
+  center.emplace_back((crop_x1+crop_x2)/2);
+  center.emplace_back((crop_y1+crop_y2)/2);
+
+  scale.clear();
+  scale.emplace_back((crop_x2-crop_x1));
+  scale.emplace_back((crop_y2-crop_y1));
+}
+
+//Pipeline
+
 Pipeline::Pipeline(const std::string &modelDir, const std::string &labelPath,
                    const int cpuThreadNum, const std::string &cpuPowerMode,
                    int inputWidth, int inputHeight,
@@ -143,6 +316,9 @@ Pipeline::Pipeline(const std::string &modelDir, const std::string &labelPath,
   detector_.reset(new Detector(modelDir, labelPath, cpuThreadNum, cpuPowerMode,
                                inputWidth, inputHeight, inputMean, inputStd,
                                scoreThreshold));
+  detector_keypoint_.reset(new Detector_KeyPoint(modelDir, labelPath, cpuThreadNum, cpuPowerMode,
+                               192, 256, inputMean, inputStd,
+                               0.5));
 }
 
 void Pipeline::VisualizeResults(const std::vector<RESULT> &results,
@@ -171,6 +347,80 @@ void Pipeline::VisualizeResults(const std::vector<RESULT> &results,
                   object.fill_color, -1);
     cv::putText(*rgbaImage, text, cv::Point2d(boundingBox.x, boundingBox.y),
                 fontFace, fontScale, cv::Scalar(255, 255, 255), fontThickness);
+  }
+}
+
+
+void Pipeline::VisualizeKptsResults(const std::vector<RESULT> &results, const std::vector<RESULT_KEYPOINT> &results_kpts,
+                                    cv::Mat *rgbaImage) {
+  int w = rgbaImage->cols;
+  int h = rgbaImage->rows;
+  for (int i = 0; i < results.size(); i++) {
+    RESULT object = results[i];
+    cv::Rect boundingBox =
+        cv::Rect(object.x * w, object.y * h, object.w * w, object.h * h) &
+        cv::Rect(0, 0, w - 1, h - 1);
+    // Configure text size
+    std::string text = object.class_name + " ";
+    text += std::to_string(static_cast<int>(object.score * 100)) + "%";
+    int fontFace = cv::FONT_HERSHEY_PLAIN;
+    double fontScale = 1.5f;
+    float fontThickness = 1.0f;
+    cv::Size textSize =
+        cv::getTextSize(text, fontFace, fontScale, fontThickness, nullptr);
+    // Draw roi object, text, and background
+    cv::rectangle(*rgbaImage, boundingBox, object.fill_color, 2);
+    cv::rectangle(*rgbaImage,
+                  cv::Point2d(boundingBox.x,
+                              boundingBox.y - round(textSize.height * 1.25f)),
+                  cv::Point2d(boundingBox.x + boundingBox.width, boundingBox.y),
+                  object.fill_color, -1);
+    cv::putText(*rgbaImage, text, cv::Point2d(boundingBox.x, boundingBox.y),
+                fontFace, fontScale, cv::Scalar(255, 255, 255), fontThickness);
+  }
+
+  const int edge[][2] = {{0, 1},
+                         {0, 2},
+                         {1, 3},
+                         {2, 4},
+                         {3, 5},
+                         {4, 6},
+                         {5, 7},
+                         {6, 8},
+                         {7, 9},
+                         {8, 10},
+                         {5, 11},
+                         {6, 12},
+                         {11, 13},
+                         {12, 14},
+                         {13, 15},
+                         {14, 16},
+                         {11, 12}};
+  for (int batchid = 0; batchid < results_kpts.size(); batchid++) {
+    for (int i = 0; i < results_kpts[batchid].num_joints; i++) {
+      if (results_kpts[batchid].keypoints[i * 3] > 0.2) {
+        int x_coord = int(results_kpts[batchid].keypoints[i * 3 + 1]);
+        int y_coord = int(results_kpts[batchid].keypoints[i * 3 + 2]);
+        cv::circle(*rgbaImage,
+                   cv::Point2d(x_coord, y_coord),
+                   2,
+                   cv::Scalar(0, 255, 255),
+                   2);
+      }
+    }
+    for (int i = 0; i < results_kpts[batchid].num_joints; i++) {
+      if(results_kpts[batchid].keypoints[edge[i][0] * 3] < 0.2 || results_kpts[batchid].keypoints[edge[i][1] * 3] < 0.2)
+        continue;
+      int x_start = int(results_kpts[batchid].keypoints[edge[i][0] * 3 + 1]);
+      int y_start = int(results_kpts[batchid].keypoints[edge[i][0] * 3 + 2]);
+      int x_end = int(results_kpts[batchid].keypoints[edge[i][1] * 3 + 1]);
+      int y_end = int(results_kpts[batchid].keypoints[edge[i][1] * 3 + 2]);
+      cv::line(*rgbaImage,
+               cv::Point2d(x_start, y_start),
+               cv::Point2d(x_end, y_end),
+               cv::Scalar(0, 255, 255),
+               2);
+    }
   }
 }
 
@@ -211,6 +461,7 @@ bool Pipeline::Process(int inTexureId, int outTextureId, int textureWidth,
                        int textureHeight, std::string savedImagePath) {
   static double readGLFBOTime = 0, writeGLTextureTime = 0;
   double preprocessTime = 0, predictTime = 0, postprocessTime = 0;
+  double preprocessTime_kpts = 0, predictTime_kpts = 0, postprocessTime_kpts = 0;
 
   // Read pixels from FBO texture to CV image
   cv::Mat rgbaImage;
@@ -222,8 +473,13 @@ bool Pipeline::Process(int inTexureId, int outTextureId, int textureWidth,
   detector_->Predict(rgbaImage, &results, &preprocessTime, &predictTime,
                      &postprocessTime);
 
+  //add keypoint pipeline
+  std::vector<RESULT_KEYPOINT> results_kpts;
+  detector_keypoint_->Predict(rgbaImage, &results, &results_kpts, &preprocessTime_kpts, &predictTime_kpts, &postprocessTime_kpts);
+
   // Visualize the objects to the origin image
-  VisualizeResults(results, &rgbaImage);
+//  VisualizeResults(results, &rgbaImage);
+  VisualizeKptsResults(results, results_kpts, &rgbaImage);
 
   // Visualize the status(performance data) to the origin image
   VisualizeStatus(readGLFBOTime, writeGLTextureTime, preprocessTime,

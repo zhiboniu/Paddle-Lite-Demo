@@ -14,6 +14,7 @@
 
 #include "Native.h"
 #include "Pipeline.h"
+#include "postprocess.h"
 
 #ifdef __cplusplus
 extern "C" {

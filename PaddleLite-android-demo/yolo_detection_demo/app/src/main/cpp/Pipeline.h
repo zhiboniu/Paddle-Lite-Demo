@@ -64,6 +64,43 @@ private:
   std::shared_ptr<paddle::lite_api::PaddlePredictor> predictor_;
 };
 
+struct RESULT_KEYPOINT {
+  std::string class_name;
+  int num_joints = 17;
+  std::vector<float> keypoints;
+};
+
+class Detector_KeyPoint {
+public:
+  explicit Detector_KeyPoint(const std::string &modelDir, const std::string &labelPath,
+                    const int cpuThreadNum, const std::string &cpuPowerMode,
+                    int inputWidth, int inputHeight,
+                    const std::vector<float> &inputMean,
+                    const std::vector<float> &inputStd, float scoreThreshold);
+
+  void Predict(const cv::Mat &rgbImage, std::vector<RESULT> *results, std::vector<RESULT_KEYPOINT> *results_kpts, 
+               double *preprocessTime, double *predictTime,
+               double *postprocessTime);
+
+  void CropImg(const cv::Mat &img, cv::Mat &crop_img, RESULT area, std::vector<float> &center, std::vector<float> &scale, float expandratio=0.2);
+
+private:
+  std::vector<cv::Scalar> GenerateColorMap(int numOfClasses);
+  void Preprocess(const cv::Mat &rgbaImage);
+  void Postprocess(std::vector<RESULT_KEYPOINT> *results,
+                                   std::vector<std::vector<float>>& center_bs,
+                                   std::vector<std::vector<float>>& scale_bs);
+private:
+  int inputWidth_;
+  int inputHeight_;
+  bool use_dark = true;
+  std::vector<float> inputMean_;
+  std::vector<float> inputStd_;
+  float scoreThreshold_;
+  std::vector<cv::Scalar> colorMap_;
+  std::shared_ptr<paddle::lite_api::PaddlePredictor> predictor_keypoint_;
+};
+
 class Pipeline {
 public:
   Pipeline(const std::string &modelDir, const std::string &labelPath,
@@ -101,7 +138,8 @@ private:
 
   // Visualize the results to origin image
   void VisualizeResults(const std::vector<RESULT> &results, cv::Mat *rgbaImage);
-
+  void VisualizeKptsResults(const std::vector<RESULT> &results, const std::vector<RESULT_KEYPOINT> &results_kpts,
+                                      cv::Mat *rgbaImage);
   // Visualize the status(performace data) to origin image
   void VisualizeStatus(double readGLFBOTime, double writeGLTextureTime,
                        double preprocessTime, double predictTime,
@@ -109,4 +147,5 @@ private:
 
 private:
   std::shared_ptr<Detector> detector_;
+  std::shared_ptr<Detector_KeyPoint> detector_keypoint_;
 };
