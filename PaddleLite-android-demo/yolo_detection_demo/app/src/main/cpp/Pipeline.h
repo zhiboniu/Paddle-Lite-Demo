@@ -83,6 +83,8 @@ public:
                double *postprocessTime);
 
   void CropImg(const cv::Mat &img, cv::Mat &crop_img, RESULT area, std::vector<float> &center, std::vector<float> &scale, float expandratio=0.2);
+  RESULT FindMaxRect(std::vector<RESULT> *results);
+  float get_threshold() {return scoreThreshold_;};
 
 private:
   std::vector<cv::Scalar> GenerateColorMap(int numOfClasses);

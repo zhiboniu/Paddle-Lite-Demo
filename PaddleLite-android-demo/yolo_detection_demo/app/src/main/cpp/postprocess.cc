@@ -189,7 +189,6 @@ void get_final_preds(std::vector<float>& heatmap,
     preds[j * 3] = heatmap[index + idx];
     coords[j * 2] = idx % heatmap_width;
     coords[j * 2 + 1] = idx / heatmap_width;
-    LOGD("KeyPoint idx: %d, conf: %f, x: %f, y: %f", idx, preds[j*3], coords[j*2], coords[j*2 + 1]);
 
     int px = int(coords[j * 2] + 0.5);
     int py = int(coords[j * 2 + 1] + 0.5);

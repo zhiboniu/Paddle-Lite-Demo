@@ -149,14 +149,14 @@ Detector_KeyPoint::Detector_KeyPoint(const std::string &modelDir, const std::str
     : inputWidth_(inputWidth), inputHeight_(inputHeight), inputMean_(inputMean),
       inputStd_(inputStd), scoreThreshold_(scoreThreshold) {
   paddle::lite_api::MobileConfig config;
-  config.set_model_from_file(modelDir + "/model_keypoint_hrnet32.nb");
+  config.set_model_from_file(modelDir + "/model_keypoint_nh18.nb");
   config.set_threads(cpuThreadNum);
   config.set_power_mode(ParsePowerMode(cpuPowerMode));
   predictor_keypoint_ =
       paddle::lite_api::CreatePaddlePredictor<paddle::lite_api::MobileConfig>(
           config);
 
-  colorMap_ = GenerateColorMap(17); //coco keypoint number is 17
+  colorMap_ = GenerateColorMap(20); //coco keypoint number is 17
 }
 
 std::vector<cv::Scalar> Detector_KeyPoint::GenerateColorMap(int numOfClasses) {
@@ -252,7 +252,8 @@ void Detector_KeyPoint::Predict(const cv::Mat &rgbaImage, std::vector<RESULT> *r
   std::vector<std::vector<float>> center_bs;
   std::vector<std::vector<float>> scale_bs;
   cv::Mat cropimgs;
-  CropImg(rgbaImage, cropimgs, (*results)[0], center, scale);
+  RESULT srect = FindMaxRect(results);
+  CropImg(rgbaImage, cropimgs, srect, center, scale);
   center_bs.emplace_back(center);
   scale_bs.emplace_back(scale);
   t = GetCurrentTime();
@@ -269,6 +270,19 @@ void Detector_KeyPoint::Predict(const cv::Mat &rgbaImage, std::vector<RESULT> *r
   Postprocess(results_kpts, center_bs, scale_bs);
   *postprocessTime = GetElapsedTime(t);
   LOGD("Detector_KeyPoint postprocess costs %f ms", *postprocessTime);
+}
+
+RESULT Detector_KeyPoint::FindMaxRect(std::vector<RESULT> *results) {
+  int maxid = 0;
+  for(int i=0; i<results->size();i++){
+    if ((*results)[i].h + (*results)[i].w > (*results)[maxid].h + (*results)[maxid].w){
+      maxid = i;
+    }
+  }
+
+  (*results)[maxid].fill_color = colorMap_[1];
+
+  return (*results)[maxid];
 }
 
 void Detector_KeyPoint::CropImg(const cv::Mat &img, cv::Mat &crop_img, RESULT area, std::vector<float> &center, std::vector<float> &scale, float expandratio) {
@@ -291,19 +305,25 @@ void Detector_KeyPoint::CropImg(const cv::Mat &img, cv::Mat &crop_img, RESULT ar
     half_h = static_cast<int>(half_w*4/3);
   }
 
-  crop_x1 = std::max(0, center_x - static_cast<int>(half_w*(1+expandratio)));
-  crop_y1 = std::max(0, center_y - static_cast<int>(half_h*(1+expandratio)));
-  crop_x2 = std::min(img.cols -1, static_cast<int>(center_x + half_w*(1+expandratio)));
-  crop_y2 = std::min(img.rows - 1, static_cast<int>(center_y + half_h*(1+expandratio)));
-  crop_img = img(cv::Range(crop_y1, crop_y2+1), cv::Range(crop_x1, crop_x2 + 1));
+  int roi_x1 = center_x - static_cast<int>(half_w*(1+expandratio));
+  int roi_y1 = center_y - static_cast<int>(half_h*(1+expandratio));
+  int roi_x2 = center_x + static_cast<int>(half_w*(1+expandratio));
+  int roi_y2 = center_y + static_cast<int>(half_h*(1+expandratio));
+  crop_x1 = std::max(0, roi_x1);
+  crop_y1 = std::max(0, roi_y1);
+  crop_x2 = std::min(img.cols -1, roi_x2);
+  crop_y2 = std::min(img.rows - 1, roi_y2);
+  cv::Mat src_img = img(cv::Range(crop_y1, crop_y2+1), cv::Range(crop_x1, crop_x2 + 1));
+
+  cv::copyMakeBorder(src_img, crop_img, std::max(0, -roi_y1), std::max(0, roi_y2-img.rows +1), std::max(0, -roi_x1), std::max(0, roi_x2-img.cols +1), cv::BorderTypes::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
 
   center.clear();
-  center.emplace_back((crop_x1+crop_x2)/2);
-  center.emplace_back((crop_y1+crop_y2)/2);
+  center.emplace_back(center_x);
+  center.emplace_back(center_y);
 
   scale.clear();
-  scale.emplace_back((crop_x2-crop_x1));
-  scale.emplace_back((crop_y2-crop_y1));
+  scale.emplace_back((half_w*2)*(1+expandratio));
+  scale.emplace_back((half_h*2)*(1+expandratio));
 }
 
 //Pipeline
@@ -396,9 +416,10 @@ void Pipeline::VisualizeKptsResults(const std::vector<RESULT> &results, const st
                          {13, 15},
                          {14, 16},
                          {11, 12}};
+  float kpts_threshold = detector_keypoint_->get_threshold();
   for (int batchid = 0; batchid < results_kpts.size(); batchid++) {
     for (int i = 0; i < results_kpts[batchid].num_joints; i++) {
-      if (results_kpts[batchid].keypoints[i * 3] > 0.2) {
+      if (results_kpts[batchid].keypoints[i * 3] > kpts_threshold) {
         int x_coord = int(results_kpts[batchid].keypoints[i * 3 + 1]);
         int y_coord = int(results_kpts[batchid].keypoints[i * 3 + 2]);
         cv::circle(*rgbaImage,
@@ -409,7 +430,7 @@ void Pipeline::VisualizeKptsResults(const std::vector<RESULT> &results, const st
       }
     }
     for (int i = 0; i < results_kpts[batchid].num_joints; i++) {
-      if(results_kpts[batchid].keypoints[edge[i][0] * 3] < 0.2 || results_kpts[batchid].keypoints[edge[i][1] * 3] < 0.2)
+      if(results_kpts[batchid].keypoints[edge[i][0] * 3] < kpts_threshold || results_kpts[batchid].keypoints[edge[i][1] * 3] < kpts_threshold)
         continue;
       int x_start = int(results_kpts[batchid].keypoints[edge[i][0] * 3 + 1]);
       int y_start = int(results_kpts[batchid].keypoints[edge[i][0] * 3 + 2]);
@@ -428,10 +449,10 @@ void Pipeline::VisualizeStatus(double readGLFBOTime, double writeGLTextureTime,
                                double preprocessTime, double predictTime,
                                double postprocessTime, cv::Mat *rgbaImage) {
   char text[255];
-  cv::Scalar fontColor = cv::Scalar(255, 255, 255);
+  cv::Scalar fontColor = cv::Scalar(255, 0, 0);
   int fontFace = cv::FONT_HERSHEY_PLAIN;
-  double fontScale = 1.f;
-  float fontThickness = 1;
+  double fontScale = 2.f;
+  float fontThickness = 2;
   sprintf(text, "Read GLFBO time: %.1f ms", readGLFBOTime);
   cv::Size textSize =
       cv::getTextSize(text, fontFace, fontScale, fontThickness, nullptr);
@@ -457,6 +478,8 @@ void Pipeline::VisualizeStatus(double readGLFBOTime, double writeGLTextureTime,
               fontThickness);
 }
 
+static std::vector<RESULT> results;
+static int idx = 0;
 bool Pipeline::Process(int inTexureId, int outTextureId, int textureWidth,
                        int textureHeight, std::string savedImagePath) {
   static double readGLFBOTime = 0, writeGLTextureTime = 0;
@@ -469,9 +492,13 @@ bool Pipeline::Process(int inTexureId, int outTextureId, int textureWidth,
                                   &readGLFBOTime);
 
   // Feed the image, run inference and parse the results
-  std::vector<RESULT> results;
-  detector_->Predict(rgbaImage, &results, &preprocessTime, &predictTime,
-                     &postprocessTime);
+  if (idx%3 == 0 or results.empty()){
+    idx = 0;
+    results.clear();
+    detector_->Predict(rgbaImage, &results, &preprocessTime, &predictTime,
+                       &postprocessTime);
+  }
+  idx++;
 
   //add keypoint pipeline
   std::vector<RESULT_KEYPOINT> results_kpts;
@@ -482,8 +509,8 @@ bool Pipeline::Process(int inTexureId, int outTextureId, int textureWidth,
   VisualizeKptsResults(results, results_kpts, &rgbaImage);
 
   // Visualize the status(performance data) to the origin image
-  VisualizeStatus(readGLFBOTime, writeGLTextureTime, preprocessTime,
-                  predictTime, postprocessTime, &rgbaImage);
+  VisualizeStatus(readGLFBOTime, writeGLTextureTime, preprocessTime_kpts,
+                  predictTime_kpts, postprocessTime_kpts, &rgbaImage);
 
   // Dump modified image if savedImagePath is set
   if (!savedImagePath.empty()) {
