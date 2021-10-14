@@ -177,20 +177,24 @@ std::vector<cv::Scalar> Detector_KeyPoint::GenerateColorMap(int numOfClasses) {
   return colorMap;
 }
 
-void Detector_KeyPoint::Preprocess(const cv::Mat &rgbaImage) {
+void Detector_KeyPoint::Preprocess(std::vector<cv::Mat> &bs_images) {
   // Set the data of input image
+  int batchsize = bs_images.size();
   auto inputTensor = predictor_keypoint_->GetInput(0);
-  std::vector<int64_t> inputShape = {1, 3, inputHeight_, inputWidth_};
+  std::vector<int64_t> inputShape = {batchsize, 3, inputHeight_, inputWidth_};
   inputTensor->Resize(inputShape);
   auto inputData = inputTensor->mutable_data<float>();
-  cv::Mat resizedRGBAImage;
-  cv::resize(rgbaImage, resizedRGBAImage, cv::Size(inputShape[3], inputShape[2]));
-  cv::Mat resizedRGBImage;
-  cv::cvtColor(resizedRGBAImage, resizedRGBImage, cv::COLOR_BGRA2RGB);
-  resizedRGBImage.convertTo(resizedRGBImage, CV_32FC3, 1.0 / 255.0f);
-  NHWC3ToNC3HW(reinterpret_cast<const float *>(resizedRGBImage.data), inputData,
-               inputMean_.data(), inputStd_.data(), inputShape[3],
-               inputShape[2]);
+  for (int i=0; i<batchsize; i++) {
+    cv::Mat resizedRGBAImage;
+    cv::resize(bs_images[i], resizedRGBAImage, cv::Size(inputShape[3], inputShape[2]));
+    cv::Mat resizedRGBImage;
+    cv::cvtColor(resizedRGBAImage, resizedRGBImage, cv::COLOR_BGRA2RGB);
+    resizedRGBImage.convertTo(resizedRGBImage, CV_32FC3, 1.0 / 255.0f);
+    auto dst_inptr = inputData + i*(3*inputHeight_*inputWidth_);
+    NHWC3ToNC3HW(reinterpret_cast<const float *>(resizedRGBImage.data), dst_inptr,
+                inputMean_.data(), inputStd_.data(), inputShape[3],
+                inputShape[2]);
+  }
   // Set the size of input image
 //  auto sizeTensor = predictor_keypoint_->GetInput(1);
 //  sizeTensor->Resize({1, 2});
@@ -248,14 +252,11 @@ void Detector_KeyPoint::Predict(const cv::Mat &rgbaImage, std::vector<RESULT> *r
   if(results->empty())
     return;
   auto t = GetCurrentTime();
-  std::vector<float> center, scale;
   std::vector<std::vector<float>> center_bs;
   std::vector<std::vector<float>> scale_bs;
-  cv::Mat cropimgs;
+  std::vector<cv::Mat> cropimgs;
   RESULT srect = FindMaxRect(results);
-  CropImg(rgbaImage, cropimgs, srect, center, scale);
-  center_bs.emplace_back(center);
-  scale_bs.emplace_back(scale);
+  CropImg(rgbaImage, cropimgs, results, center_bs, scale_bs);
   t = GetCurrentTime();
   Preprocess(cropimgs);
   *preprocessTime = GetElapsedTime(t);
@@ -285,45 +286,53 @@ RESULT Detector_KeyPoint::FindMaxRect(std::vector<RESULT> *results) {
   return (*results)[maxid];
 }
 
-void Detector_KeyPoint::CropImg(const cv::Mat &img, cv::Mat &crop_img, RESULT area, std::vector<float> &center, std::vector<float> &scale, float expandratio) {
+void Detector_KeyPoint::CropImg(const cv::Mat &img, std::vector<cv::Mat> &crop_img, std::vector<RESULT> &results, std::vector<std::vector<float>> &center_bs, std::vector<std::vector<float>> &scale_bs, float expandratio) {
   int w = img.cols;
   int h = img.rows;
-  int crop_x1 = std::max(0, static_cast<int>(area.x * w));
-  int crop_y1 = std::max(0, static_cast<int>(area.y * h));
-  int crop_x2 = std::min(img.cols -1, static_cast<int>((area.x + area.w)*w));
-  int crop_y2 = std::min(img.rows - 1, static_cast<int>((area.y + area.h)*h));
-  int center_x = (crop_x1 + crop_x2)/2.;
-  int center_y = (crop_y1 + crop_y2)/2.;
-  int half_h = (crop_y2 - crop_y1)/2.;
-  int half_w = (crop_x2 - crop_x1)/2.;
+  for (int i=0; i<std::min(results.size(), 8); i++) {
+    auto area = results[i];
+    int crop_x1 = std::max(0, static_cast<int>(area.x * w));
+    int crop_y1 = std::max(0, static_cast<int>(area.y * h));
+    int crop_x2 = std::min(img.cols -1, static_cast<int>((area.x + area.w)*w));
+    int crop_y2 = std::min(img.rows - 1, static_cast<int>((area.y + area.h)*h));
+    int center_x = (crop_x1 + crop_x2)/2.;
+    int center_y = (crop_y1 + crop_y2)/2.;
+    int half_h = (crop_y2 - crop_y1)/2.;
+    int half_w = (crop_x2 - crop_x1)/2.;
 
-  //adjust h or w to keep image ratio, expand the shorter edge
-  if (half_h*3 > half_w*4){
-    half_w = static_cast<int>(half_h*0.75);
+    //adjust h or w to keep image ratio, expand the shorter edge
+    if (half_h*3 > half_w*4){
+      half_w = static_cast<int>(half_h*0.75);
+    }
+    else{
+      half_h = static_cast<int>(half_w*4/3);
+    }
+
+    int roi_x1 = center_x - static_cast<int>(half_w*(1+expandratio));
+    int roi_y1 = center_y - static_cast<int>(half_h*(1+expandratio));
+    int roi_x2 = center_x + static_cast<int>(half_w*(1+expandratio));
+    int roi_y2 = center_y + static_cast<int>(half_h*(1+expandratio));
+    crop_x1 = std::max(0, roi_x1);
+    crop_y1 = std::max(0, roi_y1);
+    crop_x2 = std::min(img.cols -1, roi_x2);
+    crop_y2 = std::min(img.rows - 1, roi_y2);
+    cv::Mat src_img = img(cv::Range(crop_y1, crop_y2+1), cv::Range(crop_x1, crop_x2 + 1));
+
+    cv::Mat dst_img;
+    cv::copyMakeBorder(src_img, dst_img, std::max(0, -roi_y1), std::max(0, roi_y2-img.rows +1), std::max(0, -roi_x1), std::max(0, roi_x2-img.cols +1), cv::BorderTypes::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    crop_img.emplace_back(dst_img);
+
+    std::vector<float> center, scale;
+    center.emplace_back(center_x);
+    center.emplace_back(center_y);
+    scale.emplace_back((half_w*2)*(1+expandratio));
+    scale.emplace_back((half_h*2)*(1+expandratio));
+
+    center_bs.emplace_back(center);
+    scale_bs.emplace_back(scale);
   }
-  else{
-    half_h = static_cast<int>(half_w*4/3);
-  }
+  
 
-  int roi_x1 = center_x - static_cast<int>(half_w*(1+expandratio));
-  int roi_y1 = center_y - static_cast<int>(half_h*(1+expandratio));
-  int roi_x2 = center_x + static_cast<int>(half_w*(1+expandratio));
-  int roi_y2 = center_y + static_cast<int>(half_h*(1+expandratio));
-  crop_x1 = std::max(0, roi_x1);
-  crop_y1 = std::max(0, roi_y1);
-  crop_x2 = std::min(img.cols -1, roi_x2);
-  crop_y2 = std::min(img.rows - 1, roi_y2);
-  cv::Mat src_img = img(cv::Range(crop_y1, crop_y2+1), cv::Range(crop_x1, crop_x2 + 1));
-
-  cv::copyMakeBorder(src_img, crop_img, std::max(0, -roi_y1), std::max(0, roi_y2-img.rows +1), std::max(0, -roi_x1), std::max(0, roi_x2-img.cols +1), cv::BorderTypes::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
-
-  center.clear();
-  center.emplace_back(center_x);
-  center.emplace_back(center_y);
-
-  scale.clear();
-  scale.emplace_back((half_w*2)*(1+expandratio));
-  scale.emplace_back((half_h*2)*(1+expandratio));
 }
 
 //Pipeline

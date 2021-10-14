@@ -82,13 +82,13 @@ public:
                double *preprocessTime, double *predictTime,
                double *postprocessTime);
 
-  void CropImg(const cv::Mat &img, cv::Mat &crop_img, RESULT area, std::vector<float> &center, std::vector<float> &scale, float expandratio=0.2);
+  void CropImg(const cv::Mat &img, std::vector<cv::Mat> &crop_img, std::vector<RESULT> &results, std::vector<std::vector<float>> &center_bs, std::vector<std::vector<float>> &scale_bs, float expandratio=0.2);
   RESULT FindMaxRect(std::vector<RESULT> *results);
   float get_threshold() {return scoreThreshold_;};
 
 private:
   std::vector<cv::Scalar> GenerateColorMap(int numOfClasses);
-  void Preprocess(const cv::Mat &rgbaImage);
+  void Preprocess(std::vector<cv::Mat> &bs_images);
   void Postprocess(std::vector<RESULT_KEYPOINT> *results,
                                    std::vector<std::vector<float>>& center_bs,
                                    std::vector<std::vector<float>>& scale_bs);
